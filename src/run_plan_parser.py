@@ -192,13 +192,13 @@ def extract_month_plan_sections(md: str) -> Dict[int, str]:
 
 
 def build_plan_markdown_from_month_bodies(month_bodies: Dict[int, str]) -> str:
-    """5~11월 각각 독립 편집본을 `**🗓️ N월**` 블록으로 이어 붙인다."""
+    """5~11월 각각 독립 편집본을 `🗓️ N월` 블록으로 이어 붙인다."""
     parts: List[str] = []
     for m in range(5, 12):
         raw = strip_leading_month_banner(str(month_bodies.get(m) or ""), m)
         if not raw:
             continue
-        parts.append(f"**🗓️ {m}월**\n\n{raw}")
+        parts.append(f"🗓️ {m}월\n\n{raw}")
     return "\n\n".join(parts)
 
 

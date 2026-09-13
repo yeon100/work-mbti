@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import altair as alt
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 from src.run_plan_parser import (
     build_plan_markdown_from_month_bodies,
@@ -18,6 +19,7 @@ from src.run_plan_parser import (
     strip_leading_month_banner,
 )
 from src.storage import (
+    append_run_log,
     delete_diet_logs_by_indices,
     delete_run_logs_by_indices,
     load_data,
@@ -25,13 +27,17 @@ from src.storage import (
     save_data,
     upsert_diet_log,
 )
+from src.analysis import build_dashboard
 from src.mcp_tools import diet_analyze_tool, run_log_upsert_tool
-from src.services import unified_coach_chat
+from src.services import analyze_meal_text_priority, parse_chat_image_to_log, unified_coach_chat
 
 
 st.set_page_config(page_title="마라톤 & 식단 코칭 비서", page_icon="🏃", layout="wide")
 st.title("🏃 마라톤 & 식단 코칭 비서")
-st.caption("1206 상해풀마라톤 완주를 위한 식단과 훈련 도우미🔥")
+st.caption(
+    "식단·러닝은 Cursor 대화로 넣으면 됩니다. NRC 캡처를 채팅에 붙여넣거나, 여기 앱에서 확인해도 됩니다. "
+    "단기: 2026-12-06 상하이 풀 완주 · 장기: 체지방 감량·근력 증가"
+)
 
 data = load_data()
 profile = data.get("profile", {})
@@ -71,6 +77,19 @@ def diet_grade(net_kcal: float, sugar_g: float, protein_g: float) -> str:
     if abs(net_kcal) <= 500:
         return "미흡"
     return "자제"
+
+
+def normalize_image_payload(raw_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """업로드/붙여넣기 이미지를 PNG 바이트로 정규화한다."""
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return {"bytes": out.getvalue(), "mime": "image/png"}
+    except Exception:
+        return None
 
 
 def aggregate_diet(
@@ -232,8 +251,8 @@ def clamp_domain(values: List[float], min_span: float = 1.0) -> List[float]:
 
 def _meal_blocks_from_segment(segment: str) -> Dict[str, str]:
     """'아침(08:00): … 점심(13:00): …' 형태 한 덩어리에서 끼별 본문만 추출."""
-    out: Dict[str, str] = {"아침": "", "점심": "", "저녁": ""}
-    matches = list(re.finditer(r"(아침|점심|저녁)\([^)]*\):\s*", segment))
+    out: Dict[str, str] = {"아침": "", "점심": "", "저녁": "", "간식": "", "야식": ""}
+    matches = list(re.finditer(r"(아침|점심|저녁|간식|야식)\([^)]*\):\s*", segment))
     for i, mm in enumerate(matches):
         key = str(mm.group(1))
         start = mm.end()
@@ -244,7 +263,7 @@ def _meal_blocks_from_segment(segment: str) -> Dict[str, str]:
 
 def split_meal_text(meal_text: str) -> Dict[str, str]:
     """식사 텍스트를 아침/점심/저녁으로 나눈다. 한 줄·여러 줄 모두에서 레이블이 옆 칸으로 밀리지 않게 한다."""
-    result: Dict[str, str] = {"아침": "", "점심": "", "저녁": ""}
+    result: Dict[str, str] = {"아침": "", "점심": "", "저녁": "", "간식": "", "야식": ""}
     if not meal_text:
         return result
     text = meal_text.strip()
@@ -253,11 +272,11 @@ def split_meal_text(meal_text: str) -> Dict[str, str]:
         s = line.strip()
         if not s:
             continue
-        if not re.search(r"(?:아침|점심|저녁)\([^)]*\):\s*", s):
+        if not re.search(r"(?:아침|점심|저녁|간식|야식)\([^)]*\):\s*", s):
             continue
         sub = _meal_blocks_from_segment(s)
-        for key in ("아침", "점심", "저녁"):
-            if sub[key]:
+        for key in ("아침", "점심", "저녁", "간식", "야식"):
+            if sub.get(key):
                 result[key] = (
                     (result[key] + "\n" + sub[key]).strip() if result[key] else sub[key]
                 )
@@ -266,7 +285,7 @@ def split_meal_text(meal_text: str) -> Dict[str, str]:
         return result
 
     one = re.sub(r"\s+", " ", text)
-    if re.search(r"(?:아침|점심|저녁)\([^)]*\):\s*", one):
+    if re.search(r"(?:아침|점심|저녁|간식|야식)\([^)]*\):\s*", one):
         return _meal_blocks_from_segment(one)
 
     result["점심"] = text
@@ -285,6 +304,9 @@ def diet_table_rows(diet_logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "아침": meal.get("아침", ""),
                 "점심": meal.get("점심", ""),
                 "저녁": meal.get("저녁", ""),
+                "간식/야식": " / ".join(
+                    x for x in (meal.get("간식", ""), meal.get("야식", "")) if str(x).strip()
+                ),
                 "C": float(macros.get("carb_g", 0) or 0),
                 "P": float(macros.get("protein_g", 0) or 0),
                 "F": float(macros.get("fat_g", 0) or 0),
@@ -449,13 +471,140 @@ with tab_home:
             default="최근 14일",
             label_visibility="collapsed",
         )
-    left, right = st.columns(2, gap="large")
     _home_data = load_data()
     diet_logs = _home_data.get("diet_logs", [])
     run_logs = _home_data.get("run_logs", [])
     _home_prof = _home_data.get("profile", {})
     _home_nt = _home_prof.get("nutrition_targets", {}) or {}
     _home_phases = load_phases_from_profile(_home_prof)
+    _lookback = 14 if view_mode == "최근 14일" else (56 if view_mode == "주별" else 120)
+    _dash = build_dashboard(_home_data, lookback_days=_lookback)
+    _nut = _dash["nutrition"]
+    _trn = _dash["training"]
+    _ratio = _nut.get("ratio") or {}
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1:
+        _dday = int(_trn.get("dday") or 0)
+        st.metric("상하이 풀", f"D-{_dday}" if _dday > 0 else "D-Day" if _dday == 0 else "완주 이후")
+    with m2:
+        st.metric("평균 섭취 kcal", f"{float(_nut.get('avg_kcal') or 0):.0f}")
+    with m3:
+        st.metric(
+            "탄단지 비율",
+            f"{_ratio.get('carb_pct', 0):.0f} / {_ratio.get('protein_pct', 0):.0f} / {_ratio.get('fat_pct', 0):.0f}",
+            help="탄수화물 / 단백질 / 지방의 칼로리 비율(%)",
+        )
+    with m4:
+        st.metric("이번 주 km", f"{float(_trn.get('week_km') or 0):.1f}")
+    with m5:
+        st.metric(
+            "훈련량",
+            str(_trn.get("verdict") or "-"),
+            delta=None,
+        )
+    st.caption(
+        f"식단 {_nut.get('days', 0)}일 · {_nut.get('period', '')} · "
+        f"주간 목표 환산 {_trn.get('weekly_target_km') or '-'}km · "
+        f"월간 목표 {_trn.get('month_target_km') or '-'}km"
+    )
+
+    _insight_bits = list(_nut.get("insights") or []) + list(_trn.get("reasons") or []) + list(_dash.get("dual_goals") or [])
+    if _insight_bits:
+        with st.expander("코치 요약 (칼로리·탄단지·폭식 시점·훈련량)", expanded=True):
+            for _line in _insight_bits[:10]:
+                st.markdown(f"- {_line}")
+
+    _pat_l, _pat_r = st.columns(2, gap="large")
+    with _pat_l:
+        st.markdown("##### 단것·폭식이 나오는 시간")
+        _bucket = _nut.get("bucket_counts") or {}
+        if _bucket:
+            _bdf = pd.DataFrame(
+                [{"시간대": k, "횟수": int(v)} for k, v in _bucket.items()]
+            )
+            _bchart = (
+                alt.Chart(_bdf)
+                .mark_bar()
+                .encode(
+                    x=alt.X("횟수:Q", axis=alt.Axis(title="횟수", tickMinStep=1)),
+                    y=alt.Y("시간대:N", sort=["아침(05–10시)", "점심(11–15시)", "저녁(16–20시)", "야식(21시~)", "시간 미상"], axis=alt.Axis(title=None)),
+                    tooltip=["시간대", "횟수"],
+                )
+                .properties(height=160)
+            )
+            st.altair_chart(_bchart, width="stretch")
+        else:
+            st.caption("단것·폭식 키워드가 아직 없습니다. 끼니 옆에 시간(예: 저녁(21:30))을 남겨 주세요.")
+        _events = list(_nut.get("sweet_events") or []) + list(_nut.get("binge_events") or [])
+        if _events:
+            _seen = set()
+            _uniq = []
+            for _ev in _events:
+                _key = (_ev.get("date"), _ev.get("slot"), _ev.get("text"))
+                if _key in _seen:
+                    continue
+                _seen.add(_key)
+                _uniq.append(_ev)
+            _edf = pd.DataFrame(
+                [
+                    {
+                        "날짜": x.get("date"),
+                        "요일": x.get("weekday"),
+                        "때": x.get("bucket"),
+                        "키워드": ", ".join(x.get("keywords") or []),
+                        "내용": x.get("text"),
+                    }
+                    for x in _uniq[-8:]
+                ]
+            )
+            st.dataframe(_edf, width="stretch", hide_index=True, height=220)
+    with _pat_r:
+        st.markdown("##### 요일별 단것/폭식 신호")
+        _wr = _nut.get("weekday_risk") or []
+        if _wr and any(int(x.get("단것") or 0) + int(x.get("폭식신호") or 0) for x in _wr):
+            _wdf = pd.DataFrame(_wr)
+            _wlong = _wdf.melt(id_vars=["weekday"], value_vars=["단것", "폭식신호"], var_name="유형", value_name="건수")
+            _wchart = (
+                alt.Chart(_wlong)
+                .mark_bar()
+                .encode(
+                    x=alt.X("weekday:N", sort=["월", "화", "수", "목", "금", "토", "일"], axis=alt.Axis(title=None)),
+                    y=alt.Y("건수:Q", axis=alt.Axis(title="건수", tickMinStep=1)),
+                    color=alt.Color("유형:N", legend=alt.Legend(title=None)),
+                    tooltip=["weekday", "유형", "건수"],
+                )
+                .properties(height=160)
+            )
+            st.altair_chart(_wchart, width="stretch")
+        else:
+            st.caption("요일 패턴을 보려면 며칠치 식단이 더 필요합니다.")
+        _ratio_df = pd.DataFrame(
+            [
+                {"영양소": "탄수화물", "비율%": float(_ratio.get("carb_pct") or 0)},
+                {"영양소": "단백질", "비율%": float(_ratio.get("protein_pct") or 0)},
+                {"영양소": "지방", "비율%": float(_ratio.get("fat_pct") or 0)},
+            ]
+        )
+        if float(_ratio.get("from_macros") or 0) > 0:
+            _rchart = (
+                alt.Chart(_ratio_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("비율%:Q", axis=alt.Axis(title="칼로리 비율(%)"), scale=alt.Scale(domain=[0, 100])),
+                    y=alt.Y("영양소:N", sort=["탄수화물", "단백질", "지방"], axis=alt.Axis(title=None)),
+                    tooltip=["영양소", "비율%"],
+                )
+                .properties(height=140)
+            )
+            st.altair_chart(_rchart, width="stretch")
+            _am = _nut.get("avg_macros") or {}
+            st.caption(
+                f"평균 C {_am.get('carb_g', 0):.0f}g · P {_am.get('protein_g', 0):.0f}g · "
+                f"F {_am.get('fat_g', 0):.0f}g · 당 {_am.get('sugar_g', 0):.0f}g"
+            )
+
+    left, right = st.columns(2, gap="large")
     run_by_day: Dict[str, float] = {}
     for x in run_logs:
         d0 = x.get("date")
@@ -609,8 +758,11 @@ with tab_home:
 with tab_diet:
     st.subheader("식단 기록 입력")
     log_date = st.date_input("날짜", value=date.today(), key="diet_date")
-    st.caption("아침/점심/저녁을 시간대와 양까지 나눠 기록합니다.")
-    c1, c2, c3 = st.columns(3)
+    st.caption(
+        "Cursor에 말로 알려 주셔도 됩니다. 여기 적을 때는 아침/점심/저녁/간식 시간과 양을 나눠 주세요. "
+        "예: 저녁(21:30): 케이크 한 조각"
+    )
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         breakfast_time = st.text_input("아침 시간", value="08:00", key="breakfast_time")
         breakfast_text = st.text_area(
@@ -635,12 +787,28 @@ with tab_diet:
             height=100,
             key="dinner_text",
         )
+    with c4:
+        snack_time = st.text_input("간식/야식 시간", value="", key="snack_time")
+        snack_text = st.text_area(
+            "간식/야식",
+            placeholder="예: 케이크 한 조각",
+            height=100,
+            key="snack_text",
+        )
 
     meal_text = (
         f"아침({breakfast_time.strip()}): {breakfast_text.strip()}\n"
         f"점심({lunch_time.strip()}): {lunch_text.strip()}\n"
         f"저녁({dinner_time.strip()}): {dinner_text.strip()}"
     )
+    if snack_text.strip():
+        _snack_hour = None
+        _sm = re.search(r"(\d{1,2})", (snack_time or "").strip())
+        if _sm:
+            _snack_hour = int(_sm.group(1))
+        _snack_slot = "야식" if (_snack_hour is not None and (_snack_hour >= 21 or _snack_hour < 5)) else "간식"
+        _snack_time = snack_time.strip() or ("22:00" if _snack_slot == "야식" else "16:00")
+        meal_text += f"\n{_snack_slot}({_snack_time}): {snack_text.strip()}"
 
     c_ai, c_manual = st.columns(2)
     with c_ai:
@@ -676,19 +844,30 @@ with tab_diet:
                 st.success("직접 입력 저장 완료")
                 st.rerun()
 
-    st.markdown("#### 최근 식단 기록")
-    show_meal_columns = st.toggle("아침/점심/저녁 열 보기", value=False, key="show_meal_columns")
+    _diet_head_l, _diet_head_m, _diet_head_r = st.columns([8, 3, 1], vertical_alignment="center")
+    with _diet_head_l:
+        st.markdown("#### 최근 식단 기록")
+    with _diet_head_m:
+        show_meal_columns = st.toggle("아침/점심/저녁 열 보기", value=False, key="show_meal_columns")
+    with _diet_head_r:
+        _del_diet_btn = st.button(
+            "",
+            key="diet_bulk_delete_btn",
+            help="선택한 식단 기록 삭제",
+            icon=":material/delete:",
+            type="secondary",
+        )
     _d_logs = load_data().get("diet_logs", [])
     diet_df = pd.DataFrame(diet_table_rows(_d_logs))
     _wrap_w = 24
     if not diet_df.empty:
-        for col in ("아침", "점심", "저녁"):
+        for col in ("아침", "점심", "저녁", "간식/야식"):
             if col in diet_df.columns:
                 diet_df[col] = diet_df[col].apply(
                     lambda x, c=col: textwrap.fill(str(x), width=_wrap_w) if str(x).strip() else ""
                 )
     if not diet_df.empty and not show_meal_columns:
-        diet_df = diet_df.drop(columns=["아침", "점심", "저녁"], errors="ignore")
+        diet_df = diet_df.drop(columns=["아침", "점심", "저녁", "간식/야식"], errors="ignore")
 
     if not diet_df.empty:
         diet_df.insert(0, "선택", False)
@@ -706,12 +885,13 @@ with tab_diet:
             "아침": st.column_config.TextColumn("아침", width=_meal_w),
             "점심": st.column_config.TextColumn("점심", width=_meal_w),
             "저녁": st.column_config.TextColumn("저녁", width=_meal_w),
+            "간식/야식": st.column_config.TextColumn("간식/야식", width=_meal_w),
         }
-        _d_order = ["선택", "date", "총칼로리", "C", "P", "F", "S", "아침", "점심", "저녁"]
+        _d_order = ["선택", "date", "총칼로리", "C", "P", "F", "S", "아침", "점심", "저녁", "간식/야식"]
         _d_order = [c for c in _d_order if c in diet_df.columns]
         _d_cfg_use = {k: v for k, v in _diet_cfg.items() if k in diet_df.columns}
         _d_disabled = [c for c in diet_df.columns if c != "선택"]
-        st.caption("왼쪽에서 삭제할 행을 선택한 뒤, 아래 휴지통을 누르세요.")
+        st.caption("왼쪽에서 삭제할 행을 선택한 뒤, 제목 오른쪽 휴지통을 누르세요.")
         edited_diet = st.data_editor(
             diet_df,
             width="stretch",
@@ -723,15 +903,6 @@ with tab_diet:
             key="diet_table_ed",
             num_rows="fixed",
         )
-        _dbar_l, _dbar_r = st.columns([10, 1], vertical_alignment="center")
-        with _dbar_r:
-            _del_diet_btn = st.button(
-                "",
-                key="diet_bulk_delete_btn",
-                help="선택한 식단 기록 삭제",
-                icon=":material/delete:",
-                type="secondary",
-            )
         if _del_diet_btn:
             _mask = edited_diet["선택"].fillna(False)
             _mask = _mask.astype(bool) if hasattr(_mask, "astype") else _mask
@@ -760,6 +931,46 @@ def _on_run_rest_change() -> None:
 
 with tab_run:
     st.subheader("러닝 기록 입력")
+    st.caption("NRC 캡처는 Cursor 채팅에 붙여넣거나, 아래에 올려도 됩니다.")
+    _nrc_file = st.file_uploader(
+        "NRC 캡처 업로드",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="nrc_shot",
+    )
+    if _nrc_file is not None:
+        _nrc_norm = normalize_image_payload(_nrc_file.getvalue())
+        if _nrc_norm and _nrc_norm.get("bytes"):
+            st.image(bytes(_nrc_norm["bytes"]), width=240)
+            if st.button("캡처에서 기록 추출", key="nrc_parse_btn"):
+                with st.spinner("NRC 캡처를 읽는 중…"):
+                    _nrc_parsed = parse_chat_image_to_log(
+                        image_bytes=bytes(_nrc_norm["bytes"]),
+                        image_mime="image/png",
+                        user_note="NRC 러닝 기록",
+                    )
+                if _nrc_parsed.get("_error"):
+                    st.error(f"추출 실패: {_nrc_parsed.get('_error')}")
+                elif str(_nrc_parsed.get("kind", "")).lower() != "run":
+                    st.warning("러닝 기록으로 보이지 않습니다. 채팅 탭에 이미지를 넣어 보세요.")
+                else:
+                    _nr = _nrc_parsed.get("run", {}) or {}
+                    _nd = str(_nrc_parsed.get("date") or date.today().isoformat())
+                    append_run_log(
+                        log_date=_nd,
+                        distance_km=float(_nr.get("distance_km", 0) or 0),
+                        pace=str(_nr.get("pace") or ""),
+                        duration_min=float(_nr.get("duration_min", 0) or 0),
+                        calories_kcal=float(_nr.get("calories_kcal", 0) or 0),
+                        cadence_spm=int(float(_nr.get("cadence_spm", 0) or 0)),
+                        elevation_gain_m=float(_nr.get("elevation_gain_m", 0) or 0),
+                        rpe=int(float(_nr.get("rpe", 0) or 0)),
+                        memo=str(_nr.get("memo") or "NRC 캡처에서 추출"),
+                    )
+                    st.success(
+                        f"저장: {_nd} · {float(_nr.get('distance_km', 0) or 0):.2f}km"
+                    )
+                    st.rerun()
+
     _run_defaults: Dict[str, Any] = {
         "run_distance_km": 5.0,
         "run_duration_min": 35.0,
@@ -866,7 +1077,17 @@ with tab_run:
 
     st.caption("같은 날 여러 번 뛴 경우, 날짜를 같게 두고 저장 버튼으로 건마다 추가하면 됩니다.")
 
-    st.markdown("#### 최근 러닝 기록")
+    _run_head_l, _run_head_r = st.columns([11, 1], vertical_alignment="center")
+    with _run_head_l:
+        st.markdown("#### 최근 러닝 기록")
+    with _run_head_r:
+        _del_run_btn = st.button(
+            "",
+            key="run_bulk_delete_btn",
+            help="선택한 러닝 기록 삭제",
+            icon=":material/delete:",
+            type="secondary",
+        )
     _r_logs = load_data().get("run_logs", [])
     run_df = pd.DataFrame(run_table_rows(_r_logs, phases=plan_phases))
     if not run_df.empty:
@@ -905,8 +1126,8 @@ with tab_run:
         ]
         _run_order = [c for c in _run_order if c in run_df.columns]
         _run_cfg_use = {k: v for k, v in _run_cfg.items() if k in run_df.columns}
-        _run_disabled = [c for c in run_df.columns if c != "선택"]
-        st.caption("왼쪽에서 삭제할 행을 선택한 뒤, 아래 휴지통을 누르세요.")
+        _run_disabled = ["선택", "계획요약", "일치", "일치설명", "updated_at", "_storage_i"]
+        st.caption("왼쪽에서 삭제할 행을 선택한 뒤, 제목 오른쪽 휴지통을 누르세요.")
         edited_run = st.data_editor(
             run_df,
             width="stretch",
@@ -918,15 +1139,58 @@ with tab_run:
             key="run_table_ed",
             num_rows="fixed",
         )
-        _rbar_l, _rbar_r = st.columns([10, 1], vertical_alignment="center")
-        with _rbar_r:
-            _del_run_btn = st.button(
-                "",
-                key="run_bulk_delete_btn",
-                help="선택한 러닝 기록 삭제",
-                icon=":material/delete:",
-                type="secondary",
+        # 더블클릭 편집 후 포커스가 빠지면 자동 저장한다.
+        _data_for_update = load_data()
+        _logs_upd = list(_data_for_update.get("run_logs", []))
+        _changed = 0
+        for _, _row in edited_run.iterrows():
+            try:
+                _idx = int(_row.get("_storage_i"))
+            except Exception:
+                continue
+            if _idx < 0 or _idx >= len(_logs_upd):
+                continue
+            _log = dict(_logs_upd[_idx])
+
+            _new_date = str(_row.get("date", _log.get("date", ""))).strip()
+            _new_km = float(_row.get("km", _log.get("distance_km", 0)) or 0)
+            _new_pace = str(_row.get("pace", _log.get("pace", "")))
+            _new_min = float(_row.get("min", _log.get("duration_min", 0)) or 0)
+            _new_kcal = float(_row.get("kcal", _log.get("calories_kcal", 0)) or 0)
+            _new_cad = int(float(_row.get("cadence", _log.get("cadence_spm", 0)) or 0))
+            _new_rpe = int(float(_row.get("피로도", _log.get("rpe", 0)) or 0))
+            _new_memo = str(_row.get("memo", _log.get("memo", "")))
+
+            _dirty = (
+                _new_date != str(_log.get("date", ""))
+                or abs(_new_km - float(_log.get("distance_km", 0) or 0)) > 1e-9
+                or _new_pace != str(_log.get("pace", ""))
+                or abs(_new_min - float(_log.get("duration_min", 0) or 0)) > 1e-9
+                or abs(_new_kcal - float(_log.get("calories_kcal", 0) or 0)) > 1e-9
+                or _new_cad != int(_log.get("cadence_spm", 0) or 0)
+                or _new_rpe != int(_log.get("rpe", 0) or 0)
+                or _new_memo != str(_log.get("memo", ""))
             )
+            if not _dirty:
+                continue
+
+            _log["date"] = _new_date
+            _log["distance_km"] = _new_km
+            _log["pace"] = _new_pace
+            _log["duration_min"] = _new_min
+            _log["calories_kcal"] = _new_kcal
+            _log["cadence_spm"] = _new_cad
+            _log["rpe"] = _new_rpe
+            _log["memo"] = _new_memo
+            _log["updated_at"] = date.today().isoformat()
+            _logs_upd[_idx] = _log
+            _changed += 1
+
+        if _changed > 0:
+            _data_for_update["run_logs"] = _logs_upd
+            save_data(_data_for_update)
+            st.toast(f"러닝 기록 자동 저장 ({_changed}건)")
+            st.rerun()
         if _del_run_btn:
             _rmask = edited_run["선택"].fillna(False)
             _rmask = _rmask.astype(bool) if hasattr(_rmask, "astype") else _rmask
@@ -1052,6 +1316,18 @@ with tab_plan:
                 st.rerun()
 
     _plan_md = str(profile.get("custom_run_plan_md") or "").strip()
+    _normalized_plan_md = re.sub(
+        r"(?m)^\s*\*\*\s*🗓️\s*(\d{1,2})\s*월\s*\*\*\s*$",
+        r"🗓️ \1월",
+        _plan_md,
+    ).strip()
+    if _normalized_plan_md != _plan_md:
+        _plan_md = _normalized_plan_md
+        _data_norm = load_data()
+        _prof_norm = dict(_data_norm.get("profile", {}))
+        _prof_norm["custom_run_plan_md"] = _plan_md
+        _data_norm["profile"] = _prof_norm
+        save_data(_data_norm)
 
     if st.session_state.plan_training_edit:
         _by_m_edit = extract_month_plan_sections(_plan_md) if _plan_md else {}
@@ -1159,47 +1435,153 @@ with tab_chat:
             st.session_state.coach_chat_messages = []
             st.rerun()
 
-    with st.form("unified_coach_chat_form", clear_on_submit=True):
-        _fin_l, _fin_r = st.columns([14, 1], vertical_alignment="bottom")
-        with _fin_l:
-            _typed = st.text_input(
-                "메시지",
-                label_visibility="collapsed",
-                placeholder="메시지를 입력하세요…",
+    _chat_value = st.chat_input(
+        "메시지를 입력하세요… (Ctrl+V 이미지 붙여넣기 가능)",
+        key="coach_chat_input",
+        accept_file="multiple",
+        file_type=["png", "jpg", "jpeg", "webp"],
+    )
+
+    if _chat_value:
+        _pt = ""
+        _files: List[Any] = []
+        try:
+            _pt = str(getattr(_chat_value, "text", "") or "").strip()
+        except Exception:
+            _pt = ""
+        try:
+            _files = list(getattr(_chat_value, "files", []) or [])
+        except Exception:
+            _files = []
+
+        _parts: List[str] = []
+        if _pt:
+            _parts.append(_pt)
+        if _files:
+            _parts.append("[이미지 첨부]")
+        _user_msg = "\n".join(_parts).strip() or "(첨부만 전송)"
+
+        _preview_images: List[bytes] = []
+        for _f in _files:
+            _norm = normalize_image_payload(_f.getvalue())
+            if _norm and _norm.get("bytes"):
+                _preview_images.append(bytes(_norm["bytes"]))
+        st.session_state.coach_chat_messages.append(
+            {"role": "user", "content": _user_msg, "images": _preview_images}
+        )
+
+        _assistant_notes: List[str] = []
+        _image_saved_any = False
+        for _img in _preview_images:
+            with st.spinner("이미지에서 기록을 읽는 중…"):
+                _parsed = parse_chat_image_to_log(
+                    image_bytes=_img,
+                    image_mime="image/png",
+                    user_note=_pt,
+                )
+            if _parsed.get("_error"):
+                _assistant_notes.append(f"이미지 파싱 실패: `{_parsed.get('_error')}`")
+                continue
+            _kind = str(_parsed.get("kind", "unknown")).lower()
+            _log_date = str(_parsed.get("date") or date.today().isoformat())
+            if _kind == "diet":
+                _diet = _parsed.get("diet", {}) or {}
+                _meal_text = str(_diet.get("meal_text") or "채팅 이미지 업로드 기록")
+                _macros = {
+                    "kcal": float(_diet.get("kcal", 0) or 0),
+                    "carb_g": float(_diet.get("carb_g", 0) or 0),
+                    "protein_g": float(_diet.get("protein_g", 0) or 0),
+                    "fat_g": float(_diet.get("fat_g", 0) or 0),
+                    "sugar_g": float(_diet.get("sugar_g", 0) or 0),
+                }
+                upsert_diet_log(
+                    log_date=_log_date,
+                    meal_text=_meal_text,
+                    macros=_macros,
+                    feedback="채팅 이미지에서 자동 추출",
+                )
+                _assistant_notes.append(
+                    f"식단 저장: `{_log_date}`, `{_macros['kcal']:.0f} kcal`."
+                )
+                _image_saved_any = True
+            elif _kind == "run":
+                _run = _parsed.get("run", {}) or {}
+                append_run_log(
+                    log_date=_log_date,
+                    distance_km=float(_run.get("distance_km", 0) or 0),
+                    pace=str(_run.get("pace") or ""),
+                    duration_min=float(_run.get("duration_min", 0) or 0),
+                    calories_kcal=float(_run.get("calories_kcal", 0) or 0),
+                    cadence_spm=int(float(_run.get("cadence_spm", 0) or 0)),
+                    elevation_gain_m=float(_run.get("elevation_gain_m", 0) or 0),
+                    rpe=int(float(_run.get("rpe", 0) or 0)),
+                    memo=str(_run.get("memo") or "채팅 이미지에서 자동 추출"),
+                )
+                _assistant_notes.append(
+                    f"러닝 저장: `{_log_date}`, `{float(_run.get('distance_km', 0) or 0):.2f} km`."
+                )
+                _image_saved_any = True
+            else:
+                _assistant_notes.append("이미지 유형 불명확: 식단/러닝으로 분류하지 못했어요.")
+
+        _wants_text_diet_save = bool(
+            re.search(r"(먹|섭취|식단|칼로리|kcal|탄수|단백|지방|당)", _pt, flags=re.IGNORECASE)
+        )
+        if _pt and (not _preview_images) and _wants_text_diet_save:
+            _chat_data_for_text = load_data()
+            _txt_res = analyze_meal_text_priority(
+                meal_text=_pt,
+                nutrition_targets=_chat_data_for_text.get("profile", {}).get("nutrition_targets", {}),
+                recent_diet_logs=_chat_data_for_text.get("diet_logs", []),
             )
-        with _fin_r:
-            _submitted = st.form_submit_button(
-                "",
-                help="전송",
-                key="coach_chat_send_plane",
-                icon=":material/send:",
+            _txt_macros = {
+                "kcal": float(_txt_res.get("kcal", 0) or 0),
+                "carb_g": float(_txt_res.get("carb_g", 0) or 0),
+                "protein_g": float(_txt_res.get("protein_g", 0) or 0),
+                "fat_g": float(_txt_res.get("fat_g", 0) or 0),
+                "sugar_g": float(_txt_res.get("sugar_g", 0) or 0),
+            }
+            _log_date_txt = date.today().isoformat()
+            upsert_diet_log(
+                log_date=_log_date_txt,
+                meal_text=_pt,
+                macros=_txt_macros,
+                feedback=str(_txt_res.get("notes") or "텍스트 식단 자동 계산"),
+            )
+            _assistant_notes.append(
+                f"텍스트 식단 저장: `{_log_date_txt}`, `{_txt_macros['kcal']:.0f} kcal`."
             )
 
-    if _submitted and (_typed or "").strip():
-        _pt = str(_typed).strip()
-        st.session_state.coach_chat_messages.append({"role": "user", "content": _pt})
-        _chat_hist = st.session_state.coach_chat_messages[:-1]
-        _chat_data = load_data()
-        with st.spinner("기록·플랜·검색을 참고해 답변 생성 중…"):
-            _reply = unified_coach_chat(
-                _pt,
-                _chat_data.get("diet_logs", []),
-                _chat_data.get("run_logs", []),
-                _chat_data.get("profile", {}),
-                conversation_history=_chat_hist,
+        if _pt and not _image_saved_any:
+            _chat_hist = st.session_state.coach_chat_messages[:-1]
+            _chat_data = load_data()
+            with st.spinner("기록·플랜·검색을 참고해 답변 생성 중…"):
+                _reply = unified_coach_chat(
+                    _pt,
+                    _chat_data.get("diet_logs", []),
+                    _chat_data.get("run_logs", []),
+                    _chat_data.get("profile", {}),
+                    conversation_history=_chat_hist,
+                )
+            if _assistant_notes:
+                _reply = "\n".join(_assistant_notes) + "\n\n" + _reply
+            st.session_state.coach_chat_messages.append({"role": "assistant", "content": _reply})
+        else:
+            st.session_state.coach_chat_messages.append(
+                {"role": "assistant", "content": "\n".join(_assistant_notes) or "처리 완료"}
             )
-        st.session_state.coach_chat_messages.append(
-            {"role": "assistant", "content": _reply}
-        )
         st.rerun()
 
     st.caption(
         "저장된 식단·러닝 기록, 프로필의 훈련 플랜, 그리고 Tavily 웹 검색(키 설정 시)을 함께 참고합니다."
     )
 
-    for _msg in st.session_state.coach_chat_messages:
+    for _msg in reversed(st.session_state.coach_chat_messages):
         with st.chat_message(_msg["role"]):
             st.markdown(_msg["content"])
+            _imgs = _msg.get("images") if isinstance(_msg, dict) else None
+            if isinstance(_imgs, list) and _imgs:
+                st.image(_imgs, width=180)
 
 st.markdown("---")
 show_profile = st.toggle("프로필 설정 보기", value=False)

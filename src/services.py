@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 
-from src.gemini_client import call_gemini_json, call_gemini_text
+from src.gemini_client import call_gemini_image_json, call_gemini_json, call_gemini_text
 from src.tavily_search import snippets_for_diet_query, snippets_for_meal, snippets_for_running_query
 
 
@@ -50,6 +50,66 @@ def analyze_meal_with_ai(
         "protein_g": 0,
         "fat_g": 0,
         "sugar_g": 0,
+    }
+
+
+def analyze_meal_text_priority(
+    meal_text: str,
+    nutrition_targets: Dict[str, float],
+    recent_diet_logs: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    텍스트 식단 분석:
+    1) 사용자가 직접 제공한 영양성분표(1회분 수치)와 분량(예: 1/2회분) 우선 계산
+    2) 없는 항목만 웹검색 스니펫으로 보완
+    """
+    recent_summary = recent_diet_logs[-7:]
+    web_block = ""
+    ctx = snippets_for_meal(meal_text)
+    if ctx:
+        web_block = f"""
+[웹검색 요약]
+{ctx}
+"""
+    prompt = f"""
+아래 텍스트를 바탕으로 하루 총 섭취 영양소를 계산해 JSON만 반환하세요.
+
+중요 우선순위:
+1) 사용자가 직접 적은 영양성분표/수치(예: "1회분 당 kcal, 탄/단/지/당")를 최우선 반영
+2) 분량 표현(예: 1/2회분, 반개, 2개)을 반드시 곱셈 반영
+3) 수치가 없는 음식만 웹검색 요약으로 보완
+4) 추정값을 쓴 경우 notes에 간단히 남김
+
+[입력 텍스트]
+{meal_text}
+{web_block}
+
+[목표]
+{nutrition_targets}
+
+[최근 7일 식단 기록]
+{recent_summary}
+
+반환 JSON:
+{{
+  "kcal": number,
+  "carb_g": number,
+  "protein_g": number,
+  "fat_g": number,
+  "sugar_g": number,
+  "notes": string
+}}
+"""
+    result = call_gemini_json(prompt, max_tokens=1600)
+    if result and not result.get("_error"):
+        return result
+    return {
+        "kcal": 0,
+        "carb_g": 0,
+        "protein_g": 0,
+        "fat_g": 0,
+        "sugar_g": 0,
+        "notes": "텍스트 분석 실패",
     }
 
 
@@ -153,3 +213,89 @@ def unified_coach_chat(
 규칙: 의학적 진단·처방은 하지 마세요. 6~18문장 정도, 대화체로 짧은 문단으로 나누어 써도 됩니다.
 """
     return call_gemini_text(prompt, max_tokens=3200)
+
+
+def parse_chat_image_to_log(
+    image_bytes: bytes,
+    image_mime: str,
+    user_note: str = "",
+) -> Dict[str, Any]:
+    """채팅 업로드 이미지(영양성분표/NRC)를 식단/러닝 기록 구조로 파싱한다."""
+    fmt = "png"
+    if "/" in (image_mime or ""):
+        fmt = image_mime.split("/", 1)[1].strip().lower()
+    prompt = f"""
+아래 이미지를 OCR+구조화해서 JSON으로만 반환하세요.
+목표: 식단 영양성분표 이미지 또는 NRC(러닝 기록) 스크린샷을 기록으로 추가하기 위함.
+
+[사용자 메모]
+{user_note.strip()[:300]}
+
+규칙:
+1) 반드시 JSON만 출력
+2) 이미지가 식단이면 kind="diet", 러닝기록이면 kind="run", 불명확하면 kind="unknown"
+3) 숫자는 가능한 한 이미지 원문 기준으로 추출, 없으면 0
+4) date는 YYYY-MM-DD 우선, 없으면 빈 문자열
+5) confidence는 0~1
+
+스키마:
+{{
+  "kind": "diet" | "run" | "unknown",
+  "confidence": number,
+  "date": "YYYY-MM-DD" | "",
+  "diet": {{
+    "meal_text": string,
+    "kcal": number,
+    "carb_g": number,
+    "protein_g": number,
+    "fat_g": number,
+    "sugar_g": number
+  }},
+  "run": {{
+    "distance_km": number,
+    "duration_min": number,
+    "calories_kcal": number,
+    "pace": string,
+    "cadence_spm": number,
+    "elevation_gain_m": number,
+    "rpe": number,
+    "memo": string
+  }}
+}}
+"""
+    parsed = call_gemini_image_json(
+        prompt,
+        image_bytes=image_bytes,
+        image_format=fmt,
+        max_tokens=1800,
+    )
+    if parsed.get("_error") or not parsed:
+        # 1차 실패 시 더 짧고 보수적인 스키마로 재시도한다.
+        retry_prompt = f"""
+이미지에서 식단 또는 러닝 기록 숫자를 추출해 JSON만 반환하세요.
+추정 금지, 보이지 않으면 0.
+
+[사용자 메모]
+{user_note.strip()[:300]}
+
+반환:
+{{
+  "kind": "diet" | "run" | "unknown",
+  "confidence": number,
+  "date": "YYYY-MM-DD" | "",
+  "diet": {{"meal_text": string, "kcal": number, "carb_g": number, "protein_g": number, "fat_g": number, "sugar_g": number}},
+  "run": {{"distance_km": number, "duration_min": number, "calories_kcal": number, "pace": string, "cadence_spm": number, "elevation_gain_m": number, "rpe": number, "memo": string}}
+}}
+"""
+        parsed = call_gemini_image_json(
+            retry_prompt,
+            image_bytes=image_bytes,
+            image_format=fmt,
+            max_tokens=1400,
+        )
+    if parsed.get("_error"):
+        return parsed
+    kind = str(parsed.get("kind", "unknown")).strip().lower()
+    if kind not in {"diet", "run", "unknown"}:
+        parsed["kind"] = "unknown"
+    return parsed
