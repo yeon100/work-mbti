@@ -5,4 +5,4 @@ const SUBMIT_URL = "https://script.google.com/macros/s/AKfycbwM_6xKCI3eiGyoNW0oA
 
 // 팀 목록을 넣으면 팀을 목록에서 고르고, 비워 두면 직접 입력합니다.
 // 예: const TEAMS = ["기획팀", "개발팀", "디자인팀"];
-const TEAMS = [];
+const TEAMS = ["전력거래솔루션팀", "EMO알고리즘개발팀", "EMO솔루션팀", "EMO Task장"];
