@@ -99,8 +99,58 @@ img { display: block; }
   letter-spacing: -0.03em;
   color: var(--navy);
 }
-.intro { margin: 8px 0 32px; font-size: 16px; color: var(--sub); }
+.intro { margin: 8px 0 24px; font-size: 16px; color: var(--sub); }
 .start-actions { display: grid; gap: 8px; }
+
+.start-form { display: grid; gap: 10px; text-align: left; }
+.field { display: grid; gap: 4px; }
+.field-label { font-size: 13px; font-weight: 700; color: var(--sub); padding-left: 4px; }
+.field-input {
+  width: 100%;
+  height: 52px;
+  padding: 0 16px;
+  border: 2px solid var(--line);
+  border-radius: 16px;
+  background: #fff;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 0.15s;
+}
+.field-input::placeholder { color: #b3bac6; font-weight: 500; }
+.field-input:focus { border-color: var(--mint); }
+select.field-input { height: 52px; padding: 0 36px 0 16px; font-size: 16px; }
+.form-error { margin: 0; min-height: 20px; font-size: 13px; font-weight: 700; color: var(--coral); padding-left: 4px; }
+.form-note { margin: 2px 0 0; font-size: 12px; color: #8a93a3; text-align: center; }
+
+/* 결과 전달 상태 */
+.submit-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: #fff;
+  font-size: 13px;
+}
+.submit-bar .who { font-weight: 800; color: var(--navy); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.submit-status { flex: none; font-weight: 700; color: #8a93a3; display: inline-flex; align-items: center; gap: 6px; }
+.submit-status.is-sent { color: var(--mint); }
+.submit-status.is-failed { color: var(--coral); }
+.retry-btn {
+  border: 0;
+  border-radius: 8px;
+  padding: 3px 8px;
+  background: #ffe9e6;
+  color: #e2523f;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
 
 /* 문항 */
 .quiz { min-height: 100svh; display: flex; flex-direction: column; }

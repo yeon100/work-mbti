@@ -1,12 +1,42 @@
 (() => {
   const app = document.getElementById("app");
   const STORE_KEY = "wtt-answers";
+  const PARTICIPANT_KEY = "wtt-participant";
+  const RUN_KEY = "wtt-run";
+  const SENT_PREFIX = "wtt-sent-";
   const byId = Object.fromEntries(CHARACTERS.map((c) => [c.id, c]));
   const ENERGY_ORDER = ["steady", "achieve", "explore"];
 
   let answers = loadAnswers();
   let qIndex = 0;
   let compatPair = [];
+  let lastSubmit = null;
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  }
+
+  function loadParticipant() {
+    try {
+      const p = JSON.parse(localStorage.getItem(PARTICIPANT_KEY) || "null");
+      return p && p.team && p.name ? p : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function newRunId() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function startRun() {
+    answers = [];
+    qIndex = 0;
+    saveAnswers();
+    sessionStorage.setItem(RUN_KEY, newRunId());
+    go("#/q");
+  }
 
   function loadAnswers() {
     try {
@@ -129,8 +159,22 @@
 
   // ---------- 화면 ----------
 
+  function teamField(team) {
+    if (TEAMS.length) {
+      const options = TEAMS.map(
+        (t) => `<option value="${escapeHtml(t)}"${t === team ? " selected" : ""}>${escapeHtml(t)}</option>`,
+      ).join("");
+      return `<select class="field-input picker" id="team" name="team" required>
+          <option value=""${TEAMS.includes(team) ? "" : " selected"} disabled>팀을 골라 주세요</option>${options}
+        </select>`;
+    }
+    return `<input class="field-input" id="team" name="team" maxlength="30" autocomplete="organization"
+        placeholder="예: 기획팀" value="${escapeHtml(team)}" required />`;
+  }
+
   function renderStart() {
     const preview = ["walking-checklist", "brainstorm-host", "silent-fixer", "ace-captain", "experimenter", "peacekeeper"];
+    const p = loadParticipant() || { team: "", name: "" };
     app.innerHTML = `
       <main class="wrap start">
         <div class="start-collage">
@@ -139,11 +183,38 @@
         <span class="event-badge">EMO Task 워크샵</span>
         <h1 class="start-title">업무 캐릭터 테스트</h1>
         <p class="intro" id="intro">16개 질문으로 알아보는<br />EMO Task 속 나의 업무 캐릭터</p>
-        <div class="start-actions">
-          <button class="btn btn-primary btn-block" data-act="start" type="button">테스트 시작하기</button>
-          <button class="btn btn-ghost btn-block" data-go="#/dex" type="button">12개 캐릭터 구경하기</button>
-        </div>
+        <form class="start-form" data-form="start" novalidate>
+          <label class="field">
+            <span class="field-label">팀</span>
+            ${teamField(p.team)}
+          </label>
+          <label class="field">
+            <span class="field-label">이름</span>
+            <input class="field-input" id="name" name="name" maxlength="20" autocomplete="name"
+              placeholder="예: 홍길동" value="${escapeHtml(p.name)}" required />
+          </label>
+          <p class="form-error" id="form-error" role="alert"></p>
+          <div class="start-actions">
+            <button class="btn btn-primary btn-block" type="submit">테스트 시작하기</button>
+            <button class="btn btn-ghost btn-block" data-go="#/dex" type="button">12개 캐릭터 구경하기</button>
+          </div>
+          <p class="form-note">결과가 나오면 팀·이름과 함께 진행자에게 전달돼요.</p>
+        </form>
       </main>`;
+  }
+
+  function submitStart(form) {
+    const team = form.team.value.trim();
+    const name = form.name.value.trim();
+    const error = form.querySelector("#form-error");
+    const missing = !team ? form.team : !name ? form.name : null;
+    if (missing) {
+      error.textContent = !team ? (TEAMS.length ? "팀을 골라 주세요" : "팀을 입력해 주세요") : "이름을 입력해 주세요";
+      missing.focus();
+      return;
+    }
+    localStorage.setItem(PARTICIPANT_KEY, JSON.stringify({ team, name }));
+    startRun();
   }
 
   function renderQuestion() {
@@ -295,12 +366,76 @@
     if (answers.length < QUESTIONS.length) return go("#/");
     const result = score();
     const ch = findCharacter(result.axes);
+    const p = loadParticipant();
     app.innerHTML = `
-      <main class="wrap">${characterBody(ch, result)}</main>
+      <main class="wrap">
+        ${
+          p
+            ? `<div class="submit-bar">
+                <span class="who">${escapeHtml(p.team)} · ${escapeHtml(p.name)}</span>
+                <span class="submit-status" id="submit-status"></span>
+              </div>`
+            : ""
+        }
+        ${characterBody(ch, result)}
+      </main>
       <div class="actions"><div class="actions-inner">
         <button class="btn btn-ghost" data-act="restart" type="button">다시 하기</button>
         <button class="btn btn-primary" data-share="${ch.id}" type="button">결과 공유하기</button>
       </div></div>`;
+    if (p) submitResult(p, ch, result);
+  }
+
+  function setSubmitStatus(state) {
+    const el = document.getElementById("submit-status");
+    if (!el) return;
+    const view = {
+      sending: "진행자에게 보내는 중…",
+      sent: "✓ 진행자에게 전달됐어요",
+      failed: `전달 실패 <button class="retry-btn" data-act="resubmit" type="button">다시 보내기</button>`,
+      off: "진행자 수집 주소가 설정되지 않았어요",
+    }[state];
+    el.className = `submit-status is-${state}`;
+    el.innerHTML = view;
+  }
+
+  async function submitResult(p, ch, result) {
+    if (!SUBMIT_URL) return setSubmitStatus("off");
+
+    let runId = sessionStorage.getItem(RUN_KEY);
+    if (!runId) {
+      runId = newRunId();
+      sessionStorage.setItem(RUN_KEY, runId);
+    }
+    if (sessionStorage.getItem(SENT_PREFIX + runId)) return setSubmitStatus("sent");
+
+    lastSubmit = () => submitResult(p, ch, result);
+    setSubmitStatus("sending");
+    const payload = {
+      runId,
+      team: p.team,
+      name: p.name,
+      characterId: ch.id,
+      character: ch.name,
+      work: AXES.work.poles[result.axes.work],
+      collab: AXES.collab.poles[result.axes.collab],
+      energy: AXES.energy.poles[result.axes.energy],
+      answers: answers.map((v, i) => `Q${i + 1}:${v}`),
+    };
+    try {
+      // Apps Script는 CORS 응답을 주지 않아서 no-cors로 보내고, 네트워크 오류만 실패로 본다.
+      await fetch(SUBMIT_URL, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify(payload),
+        keepalive: true,
+      });
+      sessionStorage.setItem(SENT_PREFIX + runId, "1");
+      setSubmitStatus("sent");
+    } catch {
+      setSubmitStatus("failed");
+    }
   }
 
   function renderType(id) {
@@ -313,7 +448,7 @@
       </main>
       <div class="actions"><div class="actions-inner">
         <button class="btn btn-ghost" data-share="${ch.id}" type="button">공유하기</button>
-        <button class="btn btn-primary" data-act="start" type="button">나도 테스트하기</button>
+        <button class="btn btn-primary" data-go="#/" type="button">나도 테스트하기</button>
       </div></div>`;
   }
 
@@ -460,11 +595,11 @@
     if (el.dataset.go) return go(el.dataset.go);
     if (el.dataset.share) return share(el.dataset.share);
     const act = el.dataset.act;
-    if (act === "start" || act === "restart") {
-      answers = [];
-      qIndex = 0;
-      saveAnswers();
-      go("#/q");
+    if (act === "restart") {
+      if (loadParticipant()) startRun();
+      else go("#/");
+    } else if (act === "resubmit") {
+      if (lastSubmit) lastSubmit();
     } else if (act === "prev") {
       if (qIndex === 0) go("#/");
       else {
@@ -474,6 +609,20 @@
     } else if (act === "back") {
       if (history.length > 1) history.back();
       else go("#/");
+    }
+  });
+
+  app.addEventListener("submit", (e) => {
+    const form = e.target.closest("[data-form='start']");
+    if (!form) return;
+    e.preventDefault();
+    submitStart(form);
+  });
+
+  app.addEventListener("input", (e) => {
+    if (e.target.closest("[data-form='start']")) {
+      const error = document.getElementById("form-error");
+      if (error) error.textContent = "";
     }
   });
 
@@ -491,6 +640,7 @@
     const route = parts[0];
     window.scrollTo(0, 0);
     if (route === "q") {
+      if (!loadParticipant()) return go("#/");
       if (qIndex >= QUESTIONS.length) qIndex = 0;
       renderQuestion();
     } else if (route === "result") renderResult();
