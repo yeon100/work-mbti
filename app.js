@@ -66,16 +66,61 @@
     );
   }
 
-  function score() {
-    const counts = { plan: 0, flex: 0, deep: 0, link: 0, steady: 0, achieve: 0, explore: 0 };
-    answers.forEach((v) => (counts[v] += 1));
+  function axisTotals() {
+    return QUESTIONS.reduce(
+      (acc, q) => {
+        acc[q.axis] += 1;
+        return acc;
+      },
+      { work: 0, collab: 0, energy: 0 },
+    );
+  }
 
-    const work = counts.plan > counts.flex ? "plan" : "flex";
-    const collab = counts.deep > counts.link ? "deep" : "link";
+  function lastPick(axis) {
+    for (let i = QUESTIONS.length - 1; i >= 0; i -= 1) {
+      if (QUESTIONS[i].axis === axis && answers[i]) return answers[i];
+    }
+    return "";
+  }
+
+  function pairWinner(axis, a, b) {
+    const counts = scoreCounts();
+    if (counts[a] === counts[b]) {
+      const last = lastPick(axis);
+      return last === a || last === b ? last : b;
+    }
+    return counts[a] > counts[b] ? a : b;
+  }
+
+  function scoreCounts() {
+    const counts = { plan: 0, flex: 0, deep: 0, link: 0, steady: 0, achieve: 0, explore: 0 };
+    answers.forEach((v, i) => {
+      if (QUESTIONS[i] && QUESTIONS[i].options.some((o) => o.v === v)) counts[v] += 1;
+    });
+    return counts;
+  }
+
+  function indexOf(count, total) {
+    if (!total) return 0;
+    return Math.round((count / total) * 100);
+  }
+
+  function indexSummary(result) {
+    const totals = axisTotals();
+    return ["work", "collab", "energy"]
+      .map((k) => `${AXES[k].label} ${AXES[k].poles[result.axes[k]]} ${indexOf(result.counts[result.axes[k]], totals[k])}`)
+      .join(" · ");
+  }
+
+  function score() {
+    const counts = scoreCounts();
+
+    const work = pairWinner("work", "plan", "flex");
+    const collab = pairWinner("collab", "deep", "link");
 
     const top = Math.max(...ENERGY_ORDER.map((p) => counts[p]));
     const tied = ENERGY_ORDER.filter((p) => counts[p] === top);
-    const last = answers[QUESTIONS.length - 1];
+    const last = lastPick("energy");
     const energy = tied.length === 1 ? tied[0] : tied.includes(last) ? last : tied[0];
 
     const others = ENERGY_ORDER.filter((p) => p !== energy).sort((a, b) => counts[b] - counts[a]);
@@ -182,7 +227,7 @@
         </div>
         <span class="event-badge">EMO Task 워크샵</span>
         <h1 class="start-title">업무 캐릭터 테스트</h1>
-        <p class="intro" id="intro">16개 질문으로 알아보는<br />EMO Task 속 나의 업무 캐릭터</p>
+        <p class="intro" id="intro">30개 질문으로 알아보는<br />EMO Task 속 나의 업무 캐릭터와 성향 지수</p>
         <form class="start-form" data-form="start" novalidate>
           <label class="field">
             <span class="field-label">팀</span>
@@ -253,36 +298,49 @@
 
   function ratioCard(result) {
     const { counts, axes } = result;
+    const totals = axisTotals();
     const rows = [
-      { key: "work", poles: ["plan", "flex"], total: 5 },
-      { key: "collab", poles: ["deep", "link"], total: 5 },
-    ].map(({ key, poles, total }) => {
+      { key: "work", poles: ["plan", "flex"] },
+      { key: "collab", poles: ["deep", "link"] },
+    ].map(({ key, poles }) => {
+      const total = totals[key];
       const main = axes[key];
       const other = poles.find((p) => p !== main);
-      const pct = Math.round((counts[main] / total) * 100);
-      const close = counts[main] - counts[other] === 1;
+      const mainIndex = indexOf(counts[main], total);
+      const otherIndex = indexOf(counts[other], total);
+      const gap = counts[main] - counts[other];
+      const note =
+        gap === 0
+          ? "지수가 같아서, 이 축의 마지막 답으로 정했어요"
+          : gap <= 2
+            ? `${AXES[key].poles[other]} 성향도 꽤 가지고 있어요`
+            : "";
       return `
         <div class="axis">
           <div class="axis-name">${AXES[key].label}</div>
-          <div class="axis-head"><span class="on">${AXES[key].poles[main]} ${pct}%</span><span class="off">${AXES[key].poles[other]} ${100 - pct}%</span></div>
-          <div class="bar"><span class="seg-main" style="width:${pct}%"></span></div>
-          ${close ? `<p class="axis-note">${AXES[key].poles[other]} 성향도 꽤 가지고 있어요</p>` : ""}
+          <div class="axis-head"><span class="on">${AXES[key].poles[main]} <b class="index-num">${mainIndex}</b></span><span class="off">${AXES[key].poles[other]} ${otherIndex}</span></div>
+          <div class="bar"><span class="seg-main" style="width:${mainIndex}%"></span></div>
+          ${note ? `<p class="axis-note">${note}</p>` : ""}
         </div>`;
     });
 
+    const energyTotal = totals.energy;
     const energySorted = [axes.energy, ...ENERGY_ORDER.filter((p) => p !== axes.energy).sort((a, b) => counts[b] - counts[a])];
-    const pcts = energySorted.map((p) => Math.round((counts[p] / 6) * 100));
+    const pcts = energySorted.map((p) => indexOf(counts[p], energyTotal));
     const energyEven = counts[energySorted[0]] === counts[energySorted[2]];
-    const energyClose = counts[energySorted[0]] - counts[energySorted[1]] <= 1;
+    const energyTied = counts[energySorted[0]] === counts[energySorted[1]];
+    const energyClose = counts[energySorted[0]] - counts[energySorted[1]] <= 2;
     const energyNote = energyEven
       ? "세 가지 에너지가 고르게 섞여 있어요"
-      : energyClose
-        ? `${AXES.energy.poles[energySorted[1]]} 성향도 꽤 가지고 있어요`
-        : "";
+      : energyTied
+        ? "지수가 같아서, 이 축의 마지막 답으로 정했어요"
+        : energyClose
+          ? `${AXES.energy.poles[energySorted[1]]} 성향도 꽤 가지고 있어요`
+          : "";
     rows.push(`
       <div class="axis">
         <div class="axis-name">${AXES.energy.label}</div>
-        <div class="axis-head"><span class="on">${AXES.energy.poles[energySorted[0]]} ${pcts[0]}%</span><span class="off">${AXES.energy.poles[energySorted[1]]} ${pcts[1]}% · ${AXES.energy.poles[energySorted[2]]} ${pcts[2]}%</span></div>
+        <div class="axis-head"><span class="on">${AXES.energy.poles[energySorted[0]]} <b class="index-num">${pcts[0]}</b></span><span class="off">${AXES.energy.poles[energySorted[1]]} ${pcts[1]} · ${AXES.energy.poles[energySorted[2]]} ${pcts[2]}</span></div>
         <div class="bar">
           <span class="seg-main" style="width:${pcts[0]}%"></span>
           <span class="seg-2" style="width:${pcts[1]}%"></span>
@@ -291,7 +349,7 @@
         ${energyNote ? `<p class="axis-note">${energyNote}</p>` : ""}
       </div>`);
 
-    return `<section class="card"><h2>나의 성향 비율</h2>${rows.join("")}</section>`;
+    return `<section class="card"><h2>나의 성향 지수</h2><p class="index-lead">고른 답을 100점 만점으로 환산했어요. 높을수록 그쪽으로 더 기울어 있어요.</p>${rows.join("")}</section>`;
   }
 
   function characterBody(ch, result) {
@@ -420,6 +478,7 @@
       work: AXES.work.poles[result.axes.work],
       collab: AXES.collab.poles[result.axes.collab],
       energy: AXES.energy.poles[result.axes.energy],
+      index: indexSummary(result),
       answers: answers.map((v, i) => `Q${i + 1}:${v}`),
     };
     try {
@@ -458,7 +517,7 @@
       <main class="wrap">
         <button class="back-link" data-act="back" type="button">‹ 뒤로</button>
         <h1 class="page-title">캐릭터 도감</h1>
-        <p class="page-sub">일 처리 · 협업 · 에너지 세 가지 성향의 조합으로 12개 캐릭터가 나와요.</p>
+        <p class="page-sub">일 처리 · 협업 · 에너지 세 가지 성향 지수 조합으로 12개 캐릭터가 나와요.</p>
         <div class="dex-grid">
           ${CHARACTERS.map(
             (c) => `
