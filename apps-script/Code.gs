@@ -1,7 +1,7 @@
 // 구글 시트 → 확장 프로그램 → Apps Script에 붙여 넣고 웹 앱으로 배포합니다.
 
 const SHEET_NAME = "응답";
-const HEADERS = ["제출시각", "팀", "이름", "캐릭터", "일 처리", "협업", "에너지", "응답", "runId", "성향 지수"];
+const HEADERS = ["제출시각", "팀", "이름", "캐릭터", "일 처리", "협업", "에너지", "응답", "runId", "성향 지수", "예측-전력거래솔루션팀", "예측-EMO솔루션팀", "예측-EMO알고리즘개발팀", "예측-상무님"];
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -33,6 +33,14 @@ function doPost(e) {
       runId: runId,
       "성향 지수": clean_(data.index, 80),
     };
+    if (data.kind === "predict") {
+      const predict = data.predict || {};
+      values["캐릭터"] = "예측";
+      values["예측-전력거래솔루션팀"] = clean_(predict["전력거래솔루션팀"], 40);
+      values["예측-EMO솔루션팀"] = clean_(predict["EMO솔루션팀"], 40);
+      values["예측-EMO알고리즘개발팀"] = clean_(predict["EMO알고리즘개발팀"], 40);
+      values["예측-상무님"] = clean_(predict["상무님"], 40);
+    }
     const width = sheet.getLastColumn();
     const row = new Array(width).fill("");
     Object.keys(values).forEach((key) => {

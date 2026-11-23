@@ -4,6 +4,14 @@
   const PARTICIPANT_KEY = "wtt-participant";
   const RUN_KEY = "wtt-run";
   const SENT_PREFIX = "wtt-sent-";
+  const PREDICT_PREFIX = "wtt-predicted:";
+  const PREDICT_DRAFT_KEY = "wtt-predict-draft";
+  const PREDICT_TARGETS = [
+    { key: "전력거래솔루션팀", hint: "이 팀에서 가장 많을 캐릭터" },
+    { key: "EMO솔루션팀", hint: "이 팀에서 가장 많을 캐릭터" },
+    { key: "EMO알고리즘개발팀", hint: "이 팀에서 가장 많을 캐릭터" },
+    { key: "상무님", hint: "상무님 본인의 캐릭터" },
+  ];
   const byId = Object.fromEntries(CHARACTERS.map((c) => [c.id, c]));
   const ENERGY_ORDER = ["steady", "achieve", "explore"];
 
@@ -204,6 +212,40 @@
 
   // ---------- 화면 ----------
 
+  function personKey(p) {
+    return `${p.team}\t${p.name}`;
+  }
+
+  function hasPredicted(p) {
+    return sessionStorage.getItem(PREDICT_PREFIX + personKey(p)) === "1";
+  }
+
+  function characterChoiceLabel(c) {
+    const poles = ["work", "collab", "energy"].map((k) => AXES[k].poles[c.axes[k]]).join("·");
+    return `${c.name} · ${poles}`;
+  }
+
+  function loadPredictDraft(p) {
+    try {
+      const all = JSON.parse(sessionStorage.getItem(PREDICT_DRAFT_KEY) || "{}");
+      const draft = all[personKey(p)];
+      return draft && typeof draft === "object" ? draft : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function savePredictDraft(p, draft) {
+    let all = {};
+    try {
+      all = JSON.parse(sessionStorage.getItem(PREDICT_DRAFT_KEY) || "{}");
+    } catch {
+      all = {};
+    }
+    all[personKey(p)] = draft;
+    sessionStorage.setItem(PREDICT_DRAFT_KEY, JSON.stringify(all));
+  }
+
   function teamField(team) {
     if (TEAMS.length) {
       const options = TEAMS.map(
@@ -227,7 +269,7 @@
         </div>
         <span class="event-badge">EMO Task 워크샵</span>
         <h1 class="start-title">업무 캐릭터 테스트</h1>
-        <p class="intro" id="intro">30개 질문으로 알아보는<br />EMO Task 속 나의 업무 캐릭터와 성향 지수</p>
+        <p class="intro" id="intro">테스트 전에, 세 팀의 대표 캐릭터와<br />상무님 캐릭터를 먼저 찍습니다.</p>
         <form class="start-form" data-form="start" novalidate>
           <label class="field">
             <span class="field-label">팀</span>
@@ -240,10 +282,10 @@
           </label>
           <p class="form-error" id="form-error" role="alert"></p>
           <div class="start-actions">
-            <button class="btn btn-primary btn-block" type="submit">테스트 시작하기</button>
+            <button class="btn btn-primary btn-block" type="submit">이름 적고 예측하기</button>
             <button class="btn btn-ghost btn-block" data-go="#/dex" type="button">12개 캐릭터 구경하기</button>
           </div>
-          <p class="form-note">결과가 나오면 팀·이름과 함께 진행자에게 전달돼요.</p>
+          <p class="form-note">예측을 제출한 뒤에 30문항이 시작됩니다.</p>
         </form>
       </main>`;
   }
@@ -259,7 +301,101 @@
       return;
     }
     localStorage.setItem(PARTICIPANT_KEY, JSON.stringify({ team, name }));
-    startRun();
+    go("#/predict");
+  }
+
+  function renderPredict() {
+    const p = loadParticipant();
+    if (!p) return go("#/");
+    const draft = loadPredictDraft(p);
+    const fields = PREDICT_TARGETS.map((target, i) => {
+      const selected = draft[target.key] || "";
+      const options = CHARACTERS.map(
+        (c) =>
+          `<option value="${c.id}"${c.id === selected ? " selected" : ""}>${escapeHtml(characterChoiceLabel(c))}</option>`,
+      ).join("");
+      return `
+        <label class="field">
+          <span class="field-label">${escapeHtml(target.key)}</span>
+          <span class="field-hint">${escapeHtml(target.hint)}</span>
+          <select class="field-input" name="guess-${i}" required>
+            <option value=""${selected ? "" : " selected"} disabled>골라 주세요</option>
+            ${options}
+          </select>
+        </label>`;
+    }).join("");
+    app.innerHTML = `
+      <main class="wrap start">
+        <button class="back-link" data-go="#/" type="button">‹ 이름 다시 쓰기</button>
+        <h1 class="page-title">먼저 찍어 주세요</h1>
+        <p class="predict-who">${escapeHtml(p.team)} · ${escapeHtml(p.name)}</p>
+        <form class="start-form" data-form="predict" novalidate>
+          ${fields}
+          <p class="form-error" id="form-error" role="alert"></p>
+          <div class="start-actions">
+            <button class="btn btn-primary btn-block" type="submit">제출하고 테스트 시작</button>
+            <button class="btn btn-ghost btn-block" data-go="#/dex" type="button">12개 캐릭터 구경하기</button>
+          </div>
+          <p class="form-note">고른 내용은 이름과 함께 진행자에게 전달됩니다.</p>
+        </form>
+      </main>`;
+  }
+
+  async function submitPredict(form) {
+    const p = loadParticipant();
+    if (!p) return go("#/");
+    const error = form.querySelector("#form-error");
+    const picks = PREDICT_TARGETS.map((target, i) => {
+      const id = form.elements[`guess-${i}`].value;
+      const ch = byId[id];
+      return { target: target.key, id, name: ch ? ch.name : "" };
+    });
+    if (picks.some((pick) => !pick.name)) {
+      error.textContent = "네 곳 모두 골라 주세요";
+      const empty = PREDICT_TARGETS.findIndex((_, i) => !form.elements[`guess-${i}`].value);
+      if (empty >= 0) form.elements[`guess-${empty}`].focus();
+      return;
+    }
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    btn.textContent = "보내는 중…";
+    const predict = {};
+    picks.forEach((pick) => {
+      predict[pick.target] = pick.name;
+    });
+    const line = `예측 | ${picks.map((pick) => `${pick.target}=${pick.name}`).join(" | ")}`;
+    if (!SUBMIT_URL) {
+      sessionStorage.setItem(PREDICT_PREFIX + personKey(p), "1");
+      startRun();
+      return;
+    }
+    try {
+      await fetch(SUBMIT_URL, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({
+          runId: `predict-${newRunId()}`,
+          kind: "predict",
+          team: p.team,
+          name: p.name,
+          character: "예측",
+          work: "",
+          collab: "",
+          energy: "",
+          index: "",
+          answers: [line],
+          predict,
+        }),
+        keepalive: true,
+      });
+      sessionStorage.setItem(PREDICT_PREFIX + personKey(p), "1");
+      startRun();
+    } catch {
+      btn.disabled = false;
+      btn.textContent = "제출하고 테스트 시작";
+      error.textContent = "전달에 실패했어요. 한 번 더 눌러 주세요";
+    }
   }
 
   function renderQuestion() {
@@ -274,6 +410,7 @@
           <span class="progress-num">${qIndex + 1}/${total}</span>
         </div>
         <div class="quiz-body fade-in">
+          ${qIndex === 0 && loadParticipant() && hasPredicted(loadParticipant()) ? '<p class="form-note quiz-note">예측은 전달됐어요. 이제 30문항입니다.</p>' : ""}
           <p class="q-num">Q${qIndex + 1}</p>
           <h2 class="q-text">${item.q}</h2>
           <div class="options">
@@ -672,17 +809,31 @@
   });
 
   app.addEventListener("submit", (e) => {
-    const form = e.target.closest("[data-form='start']");
-    if (!form) return;
+    const start = e.target.closest("[data-form='start']");
+    const predict = e.target.closest("[data-form='predict']");
+    if (!start && !predict) return;
     e.preventDefault();
-    submitStart(form);
+    if (start) submitStart(start);
+    else submitPredict(predict);
   });
 
   app.addEventListener("input", (e) => {
-    if (e.target.closest("[data-form='start']")) {
+    if (e.target.closest("[data-form='start'], [data-form='predict']")) {
       const error = document.getElementById("form-error");
       if (error) error.textContent = "";
     }
+  });
+
+  app.addEventListener("change", (e) => {
+    const form = e.target.closest("[data-form='predict']");
+    if (!form) return;
+    const p = loadParticipant();
+    if (!p) return;
+    const draft = {};
+    PREDICT_TARGETS.forEach((target, i) => {
+      draft[target.key] = form.elements[`guess-${i}`].value;
+    });
+    savePredictDraft(p, draft);
   });
 
   app.addEventListener("change", (e) => {
@@ -699,10 +850,13 @@
     const route = parts[0];
     window.scrollTo(0, 0);
     if (route === "q") {
-      if (!loadParticipant()) return go("#/");
+      const participant = loadParticipant();
+      if (!participant) return go("#/");
+      if (!hasPredicted(participant)) return go("#/predict");
       if (qIndex >= QUESTIONS.length) qIndex = 0;
       renderQuestion();
-    } else if (route === "result") renderResult();
+    } else if (route === "predict") renderPredict();
+    else if (route === "result") renderResult();
     else if (route === "type") renderType(parts[1]);
     else if (route === "dex") renderDex();
     else if (route === "compat") renderCompat(parts[1], parts[2]);
